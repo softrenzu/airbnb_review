@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+.env
+.playwright/
+output/
+reviews.csv
+reviews.md
+dist/
+build/
