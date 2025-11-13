@@ -1,89 +1,247 @@
 
-import os,time
+import os
+
+import time
 
 from playwright.sync_api import sync_playwright
 
-LISTING_URL=os.getenv("LISTING_URL");MAX_REVIEWS=int(os.getenv("MAX_REVIEWS","50"))
 
-def safe_click(p,s,t=3000):
 
-    try:p.locator(s).first.click(timeout=t);return True
+LISTING_URL = os.getenv("LISTING_URL", "https://www.airbnb.jp/rooms/1435115775752551185")
 
-    except:return False
+MAX_REVIEWS = int(os.getenv("MAX_REVIEWS", "50"))
 
-def close_popup(p):
 
-    for s in ["button[aria-label='閉じる']","button[aria-label='Close']","button:has-text('×')"]:
 
-        if safe_click(p,s,1000):print("[INFO] Close popup:",s);return
+def log(msg):
 
-def scroll_reviews(p):
+    print(msg, flush=True)
 
-    for _ in range(4):p.keyboard.press("PageDown");time.sleep(1)
 
-def find_btn(p):
 
-    for c in ["text=レビュー","text=件のレビュー","button:has-text('レビュー')","[data-testid='reviews']"]:
+def safe_click(page, selector, desc="", timeout=5000):
 
-        if p.locator(c).first.is_visible():return c
+    try:
 
-    return None
+        page.locator(selector).first.click(timeout=timeout)
+
+        log(f"[CLICK] {desc or selector}")
+
+        return True
+
+    except Exception as e:
+
+        log(f"[MISS] {desc or selector} ({e.__class__.__name__})")
+
+        return False
+
+
+
+def close_popups(page):
+
+    log("[STEP] close_popups")
+
+    selectors = [
+
+        "button[aria-label='閉じる']",
+
+        "button[aria-label='Close']",
+
+        "button:has-text('×')",
+
+        "button:has-text('閉じる')",
+
+    ]
+
+    for sel in selectors:
+
+        if safe_click(page, sel, desc="popup close", timeout=1500):
+
+            time.sleep(1)
+
+
+
+def scroll_page_to_reviews(page):
+
+    log("[STEP] scroll_page_to_reviews")
+
+    for i in range(20):
+
+        page.mouse.wheel(0, 800)
+
+        time.sleep(0.5)
+
+
+
+def open_reviews_section(page):
+
+    log("[STEP] open_reviews_section")
+
+    candidates = [
+
+        "text=件のレビュー",
+
+        "text=レビュー",
+
+        "button:has-text('レビュー')",
+
+        "[data-testid='reviews']",
+
+    ]
+
+    for sel in candidates:
+
+        loc = page.locator(sel).first
+
+        try:
+
+            if loc.is_visible():
+
+                loc.click()
+
+                log(f"[OK] clicked reviews selector: {sel}")
+
+                return True
+
+        except Exception:
+
+            pass
+
+    log("[WARN] reviews button not found / not clickable")
+
+    return False
+
+
+
+def collect_reviews(page):
+
+    log("[STEP] collect_reviews")
+
+    os.makedirs("output", exist_ok=True)
+
+    selectors = [
+
+        "div[data-testid='review-card']",
+
+        "section:has-text('レビュー') div[data-testid='review']",
+
+    ]
+
+    reviews = None
+
+    for sel in selectors:
+
+        loc = page.locator(sel)
+
+        count = loc.count()
+
+        log(f"[INFO] selector {sel} -> {count} nodes")
+
+        if count > 0:
+
+            reviews = loc
+
+            break
+
+    rows = ["name,date,text"]
+
+    md_blocks = []
+
+    if reviews is None:
+
+        log("[WARN] no reviews found")
+
+    else:
+
+        count = min(reviews.count(), MAX_REVIEWS)
+
+        log(f"[INFO] extracting {count} reviews")
+
+        for i in range(count):
+
+            r = reviews.nth(i)
+
+            try:
+
+                name = r.locator("h3").first.inner_text() if r.locator("h3").count() else ""
+
+                date = r.locator("time").first.inner_text() if r.locator("time").count() else ""
+
+                text = r.inner_text().replace("\n", " ").strip()
+
+                rows.append(f"{name},{date},{text}")
+
+                md_blocks.append(f"### {name}\n- {date}\n{text}\n")
+
+            except Exception as e:
+
+                log(f"[ERR] review {i}: {e}")
+
+    with open("output/reviews.csv", "w") as f:
+
+        f.write("\n".join(rows))
+
+    with open("output/reviews.md", "w") as f:
+
+        f.write("\n".join(md_blocks))
+
+    page.screenshot(path="output/page.png", full_page=True)
+
+    log(f"[DONE] wrote {len(rows)-1} reviews to output/reviews.csv")
+
+
 
 def scrape():
 
+    log(f"[START] LISTING_URL={LISTING_URL}")
+
     with sync_playwright() as pw:
 
-        b=pw.chromium.launch(headless=False)
+        browser = pw.chromium.launch(
 
-        c=b.new_context(record_video_dir="output/videos")
+            headless=False,
 
-        p=c.new_page()
+            args=[
 
-        print("[1] goto",LISTING_URL)
+                "--disable-dev-shm-usage",
 
-        p.goto(LISTING_URL,wait_until="networkidle",timeout=120000);time.sleep(3)
+                "--no-sandbox",
 
-        print("[2] popup");close_popup(p);time.sleep(2)
+            ],
 
-        print("[3] scroll");scroll_reviews(p)
+        )
 
-        print("[4] detect btn");btn=find_btn(p)
+        context = browser.new_context(record_video_dir="output/videos")
 
-        if btn:print("[INFO] click",btn);p.locator(btn).click()
+        page = context.new_page()
 
-        else:print("[WARN] no reviews button")
+        log(f"[STEP] goto: {LISTING_URL}")
 
-        time.sleep(3)
+        page.goto(LISTING_URL, timeout=180000)  # networkidle はやめる
 
-        print("[5] extract")
+        page.wait_for_timeout(5000)
 
-        rev=p.locator("section:has-text('レビュー') div[data-testid='review']")
+        close_popups(page)
 
-        n=rev.count()
+        scroll_page_to_reviews(page)
 
-        csv=["name,date,text"];md=[]
+        opened = open_reviews_section(page)
 
-        for i in range(min(n,MAX_REVIEWS)):
+        if opened:
 
-            r=rev.nth(i)
+            page.wait_for_timeout(5000)
 
-            name=r.locator("h3").inner_text() if r.locator("h3").count() else ""
+        collect_reviews(page)
 
-            date=r.locator("time").inner_text() if r.locator("time").count() else ""
+        context.close()
 
-            text=r.inner_text().replace("\n"," ").strip()
+        browser.close()
 
-            csv.append(f"{name},{date},{text}");md.append(f"### {name}\n- {date}\n{text}\n")
+        log("[END] done")
 
-        os.makedirs("output",exist_ok=True)
 
-        open("output/reviews.csv","w").write("\n".join(csv))
 
-        open("output/reviews.md","w").write("\n".join(md))
+if __name__ == "__main__":
 
-        p.screenshot(path="output/page.png")
-
-        c.close();b.close();print("[DONE]",n)
-
-if __name__=="__main__":scrape()
+    scrape()
 
