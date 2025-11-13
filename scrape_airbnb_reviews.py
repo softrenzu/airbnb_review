@@ -1,377 +1,89 @@
 
-#!/usr/bin/env python3
-
-import os
-
-import time
-
-import csv
-
-from pathlib import Path
+import os,time
 
 from playwright.sync_api import sync_playwright
 
+LISTING_URL=os.getenv("LISTING_URL");MAX_REVIEWS=int(os.getenv("MAX_REVIEWS","50"))
 
+def safe_click(p,s,t=3000):
 
-LISTING_URL = os.getenv(
+    try:p.locator(s).first.click(timeout=t);return True
 
-    "LISTING_URL",
+    except:return False
 
-    "https://www.airbnb.jp/rooms/1435115775752551185",
+def close_popup(p):
 
-)
+    for s in ["button[aria-label='閉じる']","button[aria-label='Close']","button:has-text('×')"]:
 
-MAX_REVIEWS = int(os.getenv("MAX_REVIEWS", "300"))
+        if safe_click(p,s,1000):print("[INFO] Close popup:",s);return
 
+def scroll_reviews(p):
 
+    for _ in range(4):p.keyboard.press("PageDown");time.sleep(1)
 
-OUTPUT_DIR = Path("output")
+def find_btn(p):
 
-VIDEO_DIR = OUTPUT_DIR / "videos"
+    for c in ["text=レビュー","text=件のレビュー","button:has-text('レビュー')","[data-testid='reviews']"]:
 
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        if p.locator(c).first.is_visible():return c
 
-VIDEO_DIR.mkdir(parents=True, exist_ok=True)
+    return None
 
+def scrape():
 
+    with sync_playwright() as pw:
 
+        b=pw.chromium.launch(headless=False)
 
+        c=b.new_context(record_video_dir="output/videos")
 
-def log(msg: str) -> None:
+        p=c.new_page()
 
-    print(msg, flush=True)
+        print("[1] goto",LISTING_URL)
 
+        p.goto(LISTING_URL,wait_until="networkidle",timeout=120000);time.sleep(3)
 
+        print("[2] popup");close_popup(p);time.sleep(2)
 
+        print("[3] scroll");scroll_reviews(p)
 
+        print("[4] detect btn");btn=find_btn(p)
 
-def shot(page, name: str) -> None:
+        if btn:print("[INFO] click",btn);p.locator(btn).click()
 
-    path = OUTPUT_DIR / f"{name}.png"
-
-    try:
-
-        page.screenshot(path=str(path), full_page=True)
-
-        log(f"[SHOT] {path}")
-
-    except Exception as e:
-
-        log(f"[SHOT-ERR] {name}: {e}")
-
-
-
-
-
-def close_translation_popup(page) -> None:
-
-    """最初に出る『翻訳しますか？』ポップアップを閉じる"""
-
-    log("[1.1] try close translation popup if exists")
-
-    try:
-
-        # 「翻訳」の文字を含むダイアログを優先して探す
-
-        dialog = page.locator("div[role='dialog']").filter(has_text="翻訳")
-
-        if dialog.count() == 0:
-
-            # なければ一番上の dialog を見る（初回ロード直後なら翻訳ポップアップのはず）
-
-            dialog = page.locator("div[role='dialog']").first
-
-
-
-        if dialog.count() == 0:
-
-            log("[1.1] no dialog found (maybe no popup)")
-
-            return
-
-
-
-        # ダイアログ内のボタン（左上の X を含む）をクリックして閉じる
-
-        btn = dialog.locator("button").first
-
-        btn.click()
-
-        time.sleep(1)
-
-        shot(page, "step1_popup_closed")
-
-        log("[1.1] translation popup closed")
-
-    except Exception as e:
-
-        log(f"[WARN] could not close translation popup: {e}")
-
-
-
-
-
-def main() -> None:
-
-    log("[0] launch browser with Xvfb + video recording")
-
-    with sync_playwright() as p:
-
-        browser = p.chromium.launch(headless=False)
-
-        context = browser.new_context(
-
-            viewport={"width": 1400, "height": 900},
-
-            record_video_dir=str(VIDEO_DIR),
-
-        )
-
-        page = context.new_page()
-
-
-
-        # 1) ページを開く
-
-        log(f"[1] goto {LISTING_URL}")
-
-        page.goto(LISTING_URL, wait_until="networkidle", timeout=90_000)
+        else:print("[WARN] no reviews button")
 
         time.sleep(3)
 
-        shot(page, "step1_loaded")
+        print("[5] extract")
 
+        rev=p.locator("section:has-text('レビュー') div[data-testid='review']")
 
+        n=rev.count()
 
-        # 1.1) 翻訳ポップアップがあれば閉じる
+        csv=["name,date,text"];md=[]
 
-        close_translation_popup(page)
+        for i in range(min(n,MAX_REVIEWS)):
 
+            r=rev.nth(i)
 
+            name=r.locator("h3").inner_text() if r.locator("h3").count() else ""
 
-        # 1.5) レビューが見える位置までスクロール
+            date=r.locator("time").inner_text() if r.locator("time").count() else ""
 
-        log("[1.5] scroll down to reviews area before clicking")
+            text=r.inner_text().replace("\n"," ").strip()
 
-        for i in range(8):
+            csv.append(f"{name},{date},{text}");md.append(f"### {name}\n- {date}\n{text}\n")
 
-            page.mouse.wheel(0, 1200)
+        os.makedirs("output",exist_ok=True)
 
-            time.sleep(0.6)
+        open("output/reviews.csv","w").write("\n".join(csv))
 
-        shot(page, "step1_scrolled")
+        open("output/reviews.md","w").write("\n".join(md))
 
+        p.screenshot(path="output/page.png")
 
+        c.close();b.close();print("[DONE]",n)
 
-        # 2) レビューモーダルを開く
-
-        log("[2] try open reviews modal")
-
-        selectors = [
-
-            "[data-testid='pdp-reviews-modal-trigger']",
-
-            "button:has-text('すべてのレビューを表示')",
-
-            "a:has-text('すべてのレビューを表示')",
-
-            "button:has-text('レビュー')",
-
-            "a:has-text('レビュー')",
-
-        ]
-
-
-
-        modal_opened = False
-
-        for idx, sel in enumerate(selectors):
-
-            log(f"[TRY] selector: {sel}")
-
-            try:
-
-                btn = page.locator(sel).first
-
-                btn.scroll_into_view_if_needed(timeout=5_000)
-
-                btn.wait_for(state="visible", timeout=5_000)
-
-                btn.click()
-
-                time.sleep(2)
-
-                shot(page, f"step2_clicked_{idx}")
-
-                modal_opened = True
-
-                break
-
-            except Exception as e:
-
-                log(f"[NG] {sel}: {e}")
-
-
-
-        if not modal_opened:
-
-            log("[FATAL] Could NOT open reviews modal")
-
-            shot(page, "step2_fail")
-
-            context.close()
-
-            browser.close()
-
-            return
-
-
-
-        log("[OK] modal opened")
-
-        shot(page, "step2_modal_opened")
-
-
-
-        # 3) モーダル内をスクロールしてレビュー読み込み
-
-        log("[3] scroll reviews inside modal")
-
-        dialog = page.locator("div[role='dialog']").first
-
-        for i in range(25):
-
-            try:
-
-                dialog.evaluate("el => el.scrollBy(0, 2000)")
-
-            except Exception:
-
-                page.keyboard.press("PageDown")
-
-            time.sleep(0.8)
-
-            if i in (0, 10, 20):
-
-                shot(page, f"step3_scroll_{i}")
-
-
-
-        # 4) 「すべて表示」をできるだけクリック
-
-        log("[4] expand all 'すべて表示'")
-
-        for _ in range(5):
-
-            btns = page.get_by_text("すべて表示", exact=False)
-
-            count = btns.count()
-
-            for j in range(count):
-
-                try:
-
-                    btns.nth(j).click(timeout=1000)
-
-                    time.sleep(0.2)
-
-                except Exception:
-
-                    pass
-
-
-
-        # 5) レビュー抽出
-
-        log("[5] extract reviews")
-
-        cards = page.locator("[data-testid='review-card']")
-
-        count = cards.count()
-
-        log(f"[INFO] found {count} review cards")
-
-
-
-        reviews = []
-
-        for i in range(count):
-
-            if len(reviews) >= MAX_REVIEWS:
-
-                break
-
-            card = cards.nth(i)
-
-            try:
-
-                txt = card.inner_text().strip()
-
-            except Exception:
-
-                continue
-
-            if not txt:
-
-                continue
-
-
-
-            lines = [l.strip() for l in txt.splitlines() if l.strip()]
-
-            if not lines:
-
-                continue
-
-
-
-            name = lines[0]
-
-            date = ""
-
-            body = "\n".join(lines[1:])
-
-            reviews.append({"name": name, "date": date, "text": body})
-
-
-
-        # CSV 保存
-
-        csv_path = OUTPUT_DIR / "reviews.csv"
-
-        with csv_path.open("w", encoding="utf-8-sig", newline="") as f:
-
-            writer = csv.DictWriter(f, fieldnames=["name", "date", "text"])
-
-            writer.writeheader()
-
-            for r in reviews:
-
-                writer.writerow(r)
-
-        log(f"[DONE] CSV -> {csv_path}")
-
-
-
-        # MD 保存
-
-        md_path = OUTPUT_DIR / "reviews.md"
-
-        with md_path.open("w", encoding="utf-8") as f:
-
-            for r in reviews:
-
-                f.write(f"## {r['name']} ({r['date']})\n\n{r['text']}\n\n---\n\n")
-
-        log(f"[DONE] MD  -> {md_path}")
-
-
-
-        log("[6] closing browser (finalize video)")
-
-        context.close()
-
-        browser.close()
-
-        log("[DONE] finished with video")
+if __name__=="__main__":scrape()
 
