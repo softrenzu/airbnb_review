@@ -3,8 +3,6 @@ import os
 
 import time
 
-
-
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 
@@ -18,8 +16,6 @@ MAX_REVIEWS = int(os.getenv("MAX_REVIEWS", "50"))
 
 
 def safe_click(page, selector: str, timeout: int = 3000) -> bool:
-
-    """存在すればクリックして True、なければ False を返す簡易クリック"""
 
     try:
 
@@ -41,8 +37,6 @@ def safe_click(page, selector: str, timeout: int = 3000) -> bool:
 
 def close_popups(page):
 
-    """翻訳ポップアップなどを閉じる"""
-
     print("[STEP] close_popups")
 
     selectors = [
@@ -61,8 +55,6 @@ def close_popups(page):
 
         if safe_click(page, sel, timeout=2000):
 
-            # 1 回閉じられれば十分
-
             time.sleep(1)
 
             return
@@ -73,15 +65,15 @@ def close_popups(page):
 
 def scroll_page_to_reviews(page):
 
-    """ページ全体を下に何回かスクロールしてレビューが見える位置まで動かす"""
-
     print("[STEP] scroll_page_to_reviews")
 
-    for _ in range(10):
+    # 下までかなりしっかりスクロールしておく
 
-        page.mouse.wheel(0, 800)
+    for _ in range(15):
 
-        time.sleep(0.8)
+        page.mouse.wheel(0, 1000)
+
+        time.sleep(0.6)
 
 
 
@@ -89,35 +81,21 @@ def scroll_page_to_reviews(page):
 
 def parse_review_block_text(raw: str):
 
-    """
-
-    レビューカード全体のテキストから、
-
-    ざっくり [名前, 日付行, 本文] を推定する。
-
-    （まず動けば OK なので多少雑でもよし）
-
-    """
-
     lines = [l.strip() for l in raw.splitlines() if l.strip()]
 
     if not lines:
 
         return "", "", ""
 
-
-
     name = lines[0]
 
 
 
-    # 「◯日前」「◯週間前」「◯か月前」「2025年◯月」などが入っていそうな行を探す
-
     date = ""
 
-    for line in lines[1:5]:
+    for line in lines[1:6]:
 
-        if any(k in line for k in ["日前", "週間前", "か月前", "年", "月"]):
+        if any(k in line for k in ["日前", "週間前", "か月前", "月", "年"]):
 
             date = line
 
@@ -137,13 +115,9 @@ def parse_review_block_text(raw: str):
 
     body_lines = lines[start_idx:]
 
-    # カード末尾の「すべて表示」は要らないので削除
-
     body_lines = [l for l in body_lines if l != "すべて表示"]
 
     body = " ".join(body_lines).strip()
-
-
 
     return name, date, body
 
@@ -153,55 +127,25 @@ def parse_review_block_text(raw: str):
 
 def collect_visible_reviews(page):
 
-    """
-
-    モーダルは開かず、「今画面に見えているレビュー」をそのまま抜き出す。
-
-    クリックは一切せず、各カード内のテキストをまとめて CSV に出す。
-
-    """
-
     print("[STEP] collect_visible_reviews")
 
 
 
-    # 「レビュー」という単語を含むセクションを探す（日本語 UI 想定）
+    # ページ全体から「すべて表示」を探し、その一番近い親要素をレビューカードとみなす
 
-    reviews_section = page.locator(
+    buttons = page.locator("text=すべて表示")
 
-        "section:has-text('件のレビュー'), section:has-text('レビュー')"
+    total = buttons.count()
 
-    ).first
-
-
-
-    if not reviews_section or reviews_section.count() == 0:
-
-        print("[WARN] reviews section not found")
-
-        return []
-
-
-
-    # 各レビューカードはたいてい「すべて表示」リンクを含むので、それを目印にする
-
-    more_buttons = reviews_section.locator("text=すべて表示")
-
-    count = more_buttons.count()
-
-    print(f"[INFO] found {count} candidate review blocks (by 'すべて表示')")
+    print(f"[INFO] found {total} 'すべて表示' elements")
 
 
 
     reviews = []
 
+    for i in range(total):
 
-
-    for i in range(min(count, MAX_REVIEWS)):
-
-        btn = more_buttons.nth(i)
-
-        # 「すべて表示」ボタンの一番近い上位要素（section/article/li/div）をレビューカードとみなす
+        btn = buttons.nth(i)
 
         card = btn.locator(
 
@@ -209,7 +153,15 @@ def collect_visible_reviews(page):
 
         )
 
+
+
+        # レビューには必ず <time> が含まれている想定。なければスキップ（写真の「すべて表示」などを除外）
+
         try:
+
+            if card.locator("time").count() == 0:
+
+                continue
 
             raw_text = card.inner_text()
 
@@ -225,27 +177,19 @@ def collect_visible_reviews(page):
 
         if not body:
 
-            # 本文が取れていないものはスキップ
-
             print(f"[WARN] empty body for review #{i}, skip")
 
             continue
 
 
 
-        reviews.append(
+        reviews.append({"name": name, "date": date, "text": body})
 
-            {
 
-                "name": name,
 
-                "date": date,
+        if len(reviews) >= MAX_REVIEWS:
 
-                "text": body,
-
-            }
-
-        )
+            break
 
 
 
@@ -263,11 +207,17 @@ def scrape():
 
 
 
+    os.makedirs("output", exist_ok=True)
+
+
+
     with sync_playwright() as pw:
 
-        browser = pw.chromium.launch(headless=False)
+        # PDF 出力のため headless=True。動画は output/videos に保存。
 
-        context = browser.new_context()
+        browser = pw.chromium.launch(headless=True)
+
+        context = browser.new_context(record_video_dir="output/videos")
 
         page = context.new_page()
 
@@ -276,8 +226,6 @@ def scrape():
         print(f"[STEP] goto: {LISTING_URL}")
 
         try:
-
-            # networkidle だといつまでも待ってタイムアウトしやすいので load に変更
 
             page.goto(LISTING_URL, wait_until="load", timeout=120_000)
 
@@ -297,11 +245,19 @@ def scrape():
 
 
 
-        # レビューセクションが画面にある状態でスクショ
-
-        os.makedirs("output", exist_ok=True)
+        # スクリーンショットと PDF を保存
 
         page.screenshot(path="output/page.png", full_page=True)
+
+        try:
+
+            page.pdf(path="output/page.pdf", format="A4", print_background=True)
+
+            print("[INFO] saved output/page.pdf")
+
+        except Exception as e:
+
+            print(f"[WARN] page.pdf failed: {e}")
 
 
 
@@ -309,23 +265,17 @@ def scrape():
 
 
 
-        # CSV / MD 保存
-
         csv_lines = ["name,date,text"]
 
         md_lines = []
 
         for r in reviews:
 
-            # カンマは簡易的にスペースに置き換え
-
             safe_name = r["name"].replace(",", " ")
 
             safe_date = r["date"].replace(",", " ")
 
             safe_text = r["text"].replace("\n", " ").replace(",", " ")
-
-
 
             csv_lines.append(f"{safe_name},{safe_date},{safe_text}")
 
@@ -336,8 +286,6 @@ def scrape():
         with open("output/reviews.csv", "w", encoding="utf-8") as f:
 
             f.write("\n".join(csv_lines))
-
-
 
         with open("output/reviews.md", "w", encoding="utf-8") as f:
 
