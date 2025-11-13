@@ -3,7 +3,7 @@ import os
 
 import time
 
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
 
 
 
@@ -13,31 +13,33 @@ MAX_REVIEWS = int(os.getenv("MAX_REVIEWS", "50"))
 
 
 
+def log(msg):
+
+    print(msg, flush=True)
 
 
-def safe_click(page, selector: str, timeout: int = 3000) -> bool:
+
+def safe_click(page, selector, desc="", timeout=5000):
 
     try:
 
         page.locator(selector).first.click(timeout=timeout)
 
-        print(f"[CLICK] {selector}")
+        log(f"[CLICK] {desc or selector}")
 
         return True
 
-    except Exception:
+    except Exception as e:
 
-        print(f"[MISS] {selector} (TimeoutError)")
+        log(f"[MISS] {desc or selector} ({e.__class__.__name__})")
 
         return False
 
 
 
-
-
 def close_popups(page):
 
-    print("[STEP] close_popups")
+    log("[STEP] close_popups")
 
     selectors = [
 
@@ -53,255 +55,189 @@ def close_popups(page):
 
     for sel in selectors:
 
-        if safe_click(page, sel, timeout=2000):
+        if safe_click(page, sel, desc="popup close", timeout=1500):
 
             time.sleep(1)
-
-            return
-
-
 
 
 
 def scroll_page_to_reviews(page):
 
-    print("[STEP] scroll_page_to_reviews")
+    log("[STEP] scroll_page_to_reviews")
 
-    # 下までかなりしっかりスクロールしておく
+    for i in range(20):
 
-    for _ in range(15):
+        page.mouse.wheel(0, 800)
 
-        page.mouse.wheel(0, 1000)
-
-        time.sleep(0.6)
+        time.sleep(0.5)
 
 
 
+def open_reviews_section(page):
 
+    log("[STEP] open_reviews_section")
 
-def parse_review_block_text(raw: str):
+    candidates = [
 
-    lines = [l.strip() for l in raw.splitlines() if l.strip()]
+        "text=件のレビュー",
 
-    if not lines:
+        "text=レビュー",
 
-        return "", "", ""
+        "button:has-text('レビュー')",
 
-    name = lines[0]
+        "[data-testid='reviews']",
 
+    ]
 
+    for sel in candidates:
 
-    date = ""
-
-    for line in lines[1:6]:
-
-        if any(k in line for k in ["日前", "週間前", "か月前", "月", "年"]):
-
-            date = line
-
-            break
-
-
-
-    if date and date in lines:
-
-        start_idx = lines.index(date) + 1
-
-    else:
-
-        start_idx = 1
-
-
-
-    body_lines = lines[start_idx:]
-
-    body_lines = [l for l in body_lines if l != "すべて表示"]
-
-    body = " ".join(body_lines).strip()
-
-    return name, date, body
-
-
-
-
-
-def collect_visible_reviews(page):
-
-    print("[STEP] collect_visible_reviews")
-
-
-
-    # ページ全体から「すべて表示」を探し、その一番近い親要素をレビューカードとみなす
-
-    buttons = page.locator("text=すべて表示")
-
-    total = buttons.count()
-
-    print(f"[INFO] found {total} 'すべて表示' elements")
-
-
-
-    reviews = []
-
-    for i in range(total):
-
-        btn = buttons.nth(i)
-
-        card = btn.locator(
-
-            "xpath=ancestor::*[self::section or self::article or self::li or self::div][1]"
-
-        )
-
-
-
-        # レビューには必ず <time> が含まれている想定。なければスキップ（写真の「すべて表示」などを除外）
+        loc = page.locator(sel).first
 
         try:
 
-            if card.locator("time").count() == 0:
+            if loc.is_visible():
 
-                continue
+                loc.click()
 
-            raw_text = card.inner_text()
+                log(f"[OK] clicked reviews selector: {sel}")
 
-        except Exception as e:
+                return True
 
-            print(f"[WARN] failed to read review block #{i}: {e}")
+        except Exception:
 
-            continue
+            pass
 
+    log("[WARN] reviews button not found / not clickable")
 
-
-        name, date, body = parse_review_block_text(raw_text)
-
-        if not body:
-
-            print(f"[WARN] empty body for review #{i}, skip")
-
-            continue
+    return False
 
 
 
-        reviews.append({"name": name, "date": date, "text": body})
+def collect_reviews(page):
 
+    log("[STEP] collect_reviews")
 
+    os.makedirs("output", exist_ok=True)
 
-        if len(reviews) >= MAX_REVIEWS:
+    selectors = [
+
+        "div[data-testid='review-card']",
+
+        "section:has-text('レビュー') div[data-testid='review']",
+
+    ]
+
+    reviews = None
+
+    for sel in selectors:
+
+        loc = page.locator(sel)
+
+        count = loc.count()
+
+        log(f"[INFO] selector {sel} -> {count} nodes")
+
+        if count > 0:
+
+            reviews = loc
 
             break
 
+    rows = ["name,date,text"]
 
+    md_blocks = []
 
-    print(f"[INFO] collected {len(reviews)} visible reviews")
+    if reviews is None:
 
-    return reviews
+        log("[WARN] no reviews found")
 
+    else:
 
+        count = min(reviews.count(), MAX_REVIEWS)
+
+        log(f"[INFO] extracting {count} reviews")
+
+        for i in range(count):
+
+            r = reviews.nth(i)
+
+            try:
+
+                name = r.locator("h3").first.inner_text() if r.locator("h3").count() else ""
+
+                date = r.locator("time").first.inner_text() if r.locator("time").count() else ""
+
+                text = r.inner_text().replace("\n", " ").strip()
+
+                rows.append(f"{name},{date},{text}")
+
+                md_blocks.append(f"### {name}\n- {date}\n{text}\n")
+
+            except Exception as e:
+
+                log(f"[ERR] review {i}: {e}")
+
+    with open("output/reviews.csv", "w") as f:
+
+        f.write("\n".join(rows))
+
+    with open("output/reviews.md", "w") as f:
+
+        f.write("\n".join(md_blocks))
+
+    page.screenshot(path="output/page.png", full_page=True)
+
+    log(f"[DONE] wrote {len(rows)-1} reviews to output/reviews.csv")
 
 
 
 def scrape():
 
-    print(f"[START] LISTING_URL={LISTING_URL}")
-
-
-
-    os.makedirs("output", exist_ok=True)
-
-
+    log(f"[START] LISTING_URL={LISTING_URL}")
 
     with sync_playwright() as pw:
 
-        # PDF 出力のため headless=True。動画は output/videos に保存。
+        browser = pw.chromium.launch(
 
-        browser = pw.chromium.launch(headless=True)
+            headless=False,
+
+            args=[
+
+                "--disable-dev-shm-usage",
+
+                "--no-sandbox",
+
+            ],
+
+        )
 
         context = browser.new_context(record_video_dir="output/videos")
 
         page = context.new_page()
 
+        log(f"[STEP] goto: {LISTING_URL}")
 
+        page.goto(LISTING_URL, timeout=180000)  # networkidle はやめる
 
-        print(f"[STEP] goto: {LISTING_URL}")
-
-        try:
-
-            page.goto(LISTING_URL, wait_until="load", timeout=120_000)
-
-        except PlaywrightTimeoutError:
-
-            print("[WARN] goto timeout, continue anyway")
-
-
-
-        time.sleep(5)
-
-
+        page.wait_for_timeout(5000)
 
         close_popups(page)
 
         scroll_page_to_reviews(page)
 
+        opened = open_reviews_section(page)
 
+        if opened:
 
-        # スクリーンショットと PDF を保存
+            page.wait_for_timeout(5000)
 
-        page.screenshot(path="output/page.png", full_page=True)
-
-        try:
-
-            page.pdf(path="output/page.pdf", format="A4", print_background=True)
-
-            print("[INFO] saved output/page.pdf")
-
-        except Exception as e:
-
-            print(f"[WARN] page.pdf failed: {e}")
-
-
-
-        reviews = collect_visible_reviews(page)
-
-
-
-        csv_lines = ["name,date,text"]
-
-        md_lines = []
-
-        for r in reviews:
-
-            safe_name = r["name"].replace(",", " ")
-
-            safe_date = r["date"].replace(",", " ")
-
-            safe_text = r["text"].replace("\n", " ").replace(",", " ")
-
-            csv_lines.append(f"{safe_name},{safe_date},{safe_text}")
-
-            md_lines.append(f"### {r['name']}\n- {r['date']}\n{r['text']}\n")
-
-
-
-        with open("output/reviews.csv", "w", encoding="utf-8") as f:
-
-            f.write("\n".join(csv_lines))
-
-        with open("output/reviews.md", "w", encoding="utf-8") as f:
-
-            f.write("\n".join(md_lines))
-
-
-
-        print(f"[DONE] wrote {len(reviews)} reviews to output/reviews.csv")
-
-
+        collect_reviews(page)
 
         context.close()
 
         browser.close()
 
-
+        log("[END] done")
 
 
 
