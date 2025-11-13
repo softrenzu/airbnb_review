@@ -1,0 +1,12 @@
+services:
+  scraper:
+    build: .
+    environment:
+      # Override these as needed:
+      - LISTING_URL=https://www.airbnb.jp/rooms/1435115775752551185
+      - MAX_REVIEWS=1000
+      - CLICK_TRANSLATE=true
+      - HEADFUL=false
+      - SLOWMO_MS=0
+    volumes:
+      - ./output:/app

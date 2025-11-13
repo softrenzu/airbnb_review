@@ -1,5 +1,21 @@
+<<<<<<< HEAD
 
 __pycache__/
 
 *.pyc
 
+=======
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+.env
+.playwright/
+output/
+reviews.csv
+reviews.md
+dist/
+build/
+>>>>>>> 141d6f088ca994140e8fdd60409d443de174cee7
