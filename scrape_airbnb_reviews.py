@@ -3,43 +3,21 @@ import os
 
 import time
 
-from playwright.sync_api import sync_playwright
+from pathlib import Path
+
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 
 
 LISTING_URL = os.getenv("LISTING_URL", "https://www.airbnb.jp/rooms/1435115775752551185")
 
-MAX_REVIEWS = int(os.getenv("MAX_REVIEWS", "50"))
-
-
-
-def log(msg):
-
-    print(msg, flush=True)
-
-
-
-def safe_click(page, selector, desc="", timeout=5000):
-
-    try:
-
-        page.locator(selector).first.click(timeout=timeout)
-
-        log(f"[CLICK] {desc or selector}")
-
-        return True
-
-    except Exception as e:
-
-        log(f"[MISS] {desc or selector} ({e.__class__.__name__})")
-
-        return False
+OUTPUT_DIR = Path("output")
 
 
 
 def close_popups(page):
 
-    log("[STEP] close_popups")
+    # 翻訳ポップアップなどをなるべく閉じる（失敗しても無視）
 
     selectors = [
 
@@ -49,199 +27,121 @@ def close_popups(page):
 
         "button:has-text('×')",
 
-        "button:has-text('閉じる')",
-
     ]
 
     for sel in selectors:
-
-        if safe_click(page, sel, desc="popup close", timeout=1500):
-
-            time.sleep(1)
-
-
-
-def scroll_page_to_reviews(page):
-
-    log("[STEP] scroll_page_to_reviews")
-
-    for i in range(20):
-
-        page.mouse.wheel(0, 800)
-
-        time.sleep(0.5)
-
-
-
-def open_reviews_section(page):
-
-    log("[STEP] open_reviews_section")
-
-    candidates = [
-
-        "text=件のレビュー",
-
-        "text=レビュー",
-
-        "button:has-text('レビュー')",
-
-        "[data-testid='reviews']",
-
-    ]
-
-    for sel in candidates:
-
-        loc = page.locator(sel).first
 
         try:
 
-            if loc.is_visible():
+            page.locator(sel).first.click(timeout=2000)
 
-                loc.click()
+            print(f"[CLICK] popup close: {sel}")
 
-                log(f"[OK] clicked reviews selector: {sel}")
+            time.sleep(1)
 
-                return True
+            return
 
-        except Exception:
+        except PlaywrightTimeoutError:
 
-            pass
-
-    log("[WARN] reviews button not found / not clickable")
-
-    return False
+            print(f"[MISS] popup close: {sel}")
 
 
 
-def collect_reviews(page):
+def main():
 
-    log("[STEP] collect_reviews")
-
-    os.makedirs("output", exist_ok=True)
-
-    selectors = [
-
-        "div[data-testid='review-card']",
-
-        "section:has-text('レビュー') div[data-testid='review']",
-
-    ]
-
-    reviews = None
-
-    for sel in selectors:
-
-        loc = page.locator(sel)
-
-        count = loc.count()
-
-        log(f"[INFO] selector {sel} -> {count} nodes")
-
-        if count > 0:
-
-            reviews = loc
-
-            break
-
-    rows = ["name,date,text"]
-
-    md_blocks = []
-
-    if reviews is None:
-
-        log("[WARN] no reviews found")
-
-    else:
-
-        count = min(reviews.count(), MAX_REVIEWS)
-
-        log(f"[INFO] extracting {count} reviews")
-
-        for i in range(count):
-
-            r = reviews.nth(i)
-
-            try:
-
-                name = r.locator("h3").first.inner_text() if r.locator("h3").count() else ""
-
-                date = r.locator("time").first.inner_text() if r.locator("time").count() else ""
-
-                text = r.inner_text().replace("\n", " ").strip()
-
-                rows.append(f"{name},{date},{text}")
-
-                md_blocks.append(f"### {name}\n- {date}\n{text}\n")
-
-            except Exception as e:
-
-                log(f"[ERR] review {i}: {e}")
-
-    with open("output/reviews.csv", "w") as f:
-
-        f.write("\n".join(rows))
-
-    with open("output/reviews.md", "w") as f:
-
-        f.write("\n".join(md_blocks))
-
-    page.screenshot(path="output/page.png", full_page=True)
-
-    log(f"[DONE] wrote {len(rows)-1} reviews to output/reviews.csv")
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 
-def scrape():
+    print(f"[START] LISTING_URL={LISTING_URL}")
 
-    log(f"[START] LISTING_URL={LISTING_URL}")
 
-    with sync_playwright() as pw:
 
-        browser = pw.chromium.launch(
+    with sync_playwright() as p:
 
-            headless=False,
+        browser = p.chromium.launch(headless=True)
 
-            args=[
-
-                "--disable-dev-shm-usage",
-
-                "--no-sandbox",
-
-            ],
-
-        )
-
-        context = browser.new_context(record_video_dir="output/videos")
+        context = browser.new_context(viewport={"width": 1280, "height": 720})
 
         page = context.new_page()
 
-        log(f"[STEP] goto: {LISTING_URL}")
 
-        page.goto(LISTING_URL, timeout=180000)  # networkidle はやめる
 
-        page.wait_for_timeout(5000)
+        print("[STEP] goto:", LISTING_URL)
+
+        page.goto(LISTING_URL, wait_until="networkidle", timeout=120000)
+
+
+
+        # ちょっと待ってからポップアップ閉じる
+
+        time.sleep(5)
+
+        print("[STEP] close_popups")
 
         close_popups(page)
 
-        scroll_page_to_reviews(page)
 
-        opened = open_reviews_section(page)
 
-        if opened:
+        # レビューが見えるあたりまで軽くスクロール（失敗しても気にしない）
 
-            page.wait_for_timeout(5000)
+        try:
 
-        collect_reviews(page)
+            print("[STEP] scroll a bit")
+
+            page.mouse.wheel(0, 800)
+
+            time.sleep(3)
+
+            page.mouse.wheel(0, 800)
+
+            time.sleep(3)
+
+        except Exception as e:
+
+            print("[WARN] scroll failed:", e)
+
+
+
+        # フルページでスクリーンショット
+
+        png_path = OUTPUT_DIR / "page.png"
+
+        print("[STEP] screenshot ->", png_path)
+
+        page.screenshot(path=str(png_path), full_page=True)
+
+
+
+        # ページのテキストも保存（後で解析する用）
+
+        txt_path = OUTPUT_DIR / "page.txt"
+
+        print("[STEP] save body text ->", txt_path)
+
+        try:
+
+            body_text = page.inner_text("body")
+
+        except Exception:
+
+            body_text = page.content()
+
+        txt_path.write_text(body_text, encoding="utf-8")
+
+
+
+        print("[END] done")
+
+
 
         context.close()
 
         browser.close()
 
-        log("[END] done")
-
 
 
 if __name__ == "__main__":
 
-    scrape()
+    main()
 
