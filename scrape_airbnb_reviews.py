@@ -1,4 +1,6 @@
 
+#!/usr/bin/env python3
+
 import os
 
 import time
@@ -11,15 +13,21 @@ from playwright.sync_api import sync_playwright
 
 
 
-LISTING_URL = os.getenv("LISTING_URL", "https://www.airbnb.jp/rooms/1435115775752551185")
+LISTING_URL = os.getenv(
+
+    "LISTING_URL",
+
+    "https://www.airbnb.jp/rooms/1435115775752551185",
+
+)
 
 MAX_REVIEWS = int(os.getenv("MAX_REVIEWS", "300"))
+
+
 
 OUTPUT_DIR = Path("output")
 
 VIDEO_DIR = OUTPUT_DIR / "videos"
-
-
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -27,29 +35,85 @@ VIDEO_DIR.mkdir(parents=True, exist_ok=True)
 
 
 
-def log(msg: str):
+
+
+def log(msg: str) -> None:
 
     print(msg, flush=True)
 
 
 
-def shot(page, name: str):
 
-    """各ステップでスクショを取る"""
+
+def shot(page, name: str) -> None:
 
     path = OUTPUT_DIR / f"{name}.png"
 
-    page.screenshot(path=str(path), full_page=True)
+    try:
 
-    log(f"[SHOT] {path}")
+        page.screenshot(path=str(path), full_page=True)
+
+        log(f"[SHOT] {path}")
+
+    except Exception as e:
+
+        log(f"[SHOT-ERR] {name}: {e}")
 
 
 
-def main():
+
+
+def close_translation_popup(page) -> None:
+
+    """最初に出る『翻訳しますか？』ポップアップを閉じる"""
+
+    log("[1.1] try close translation popup if exists")
+
+    try:
+
+        # 「翻訳」の文字を含むダイアログを優先して探す
+
+        dialog = page.locator("div[role='dialog']").filter(has_text="翻訳")
+
+        if dialog.count() == 0:
+
+            # なければ一番上の dialog を見る（初回ロード直後なら翻訳ポップアップのはず）
+
+            dialog = page.locator("div[role='dialog']").first
+
+
+
+        if dialog.count() == 0:
+
+            log("[1.1] no dialog found (maybe no popup)")
+
+            return
+
+
+
+        # ダイアログ内のボタン（左上の X を含む）をクリックして閉じる
+
+        btn = dialog.locator("button").first
+
+        btn.click()
+
+        time.sleep(1)
+
+        shot(page, "step1_popup_closed")
+
+        log("[1.1] translation popup closed")
+
+    except Exception as e:
+
+        log(f"[WARN] could not close translation popup: {e}")
+
+
+
+
+
+def main() -> None:
 
     log("[0] launch browser with Xvfb + video recording")
-
-
 
     with sync_playwright() as p:
 
@@ -67,29 +131,53 @@ def main():
 
 
 
+        # 1) ページを開く
+
         log(f"[1] goto {LISTING_URL}")
 
         page.goto(LISTING_URL, wait_until="networkidle", timeout=90_000)
+
+        time.sleep(3)
 
         shot(page, "step1_loaded")
 
 
 
-        # ===== レビューを開く強化版 =====
+        # 1.1) 翻訳ポップアップがあれば閉じる
+
+        close_translation_popup(page)
+
+
+
+        # 1.5) レビューが見える位置までスクロール
+
+        log("[1.5] scroll down to reviews area before clicking")
+
+        for i in range(8):
+
+            page.mouse.wheel(0, 1200)
+
+            time.sleep(0.6)
+
+        shot(page, "step1_scrolled")
+
+
+
+        # 2) レビューモーダルを開く
 
         log("[2] try open reviews modal")
 
-
-
         selectors = [
 
-            '[data-testid="pdp-reviews-modal-trigger"]',
+            "[data-testid='pdp-reviews-modal-trigger']",
 
-            'button:has-text("レビュー")',
+            "button:has-text('すべてのレビューを表示')",
 
-            'a:has-text("レビュー")',
+            "a:has-text('すべてのレビューを表示')",
 
-            'div:has-text("件のレビュー")',
+            "button:has-text('レビュー')",
+
+            "a:has-text('レビュー')",
 
         ]
 
@@ -97,7 +185,7 @@ def main():
 
         modal_opened = False
 
-        for sel in selectors:
+        for idx, sel in enumerate(selectors):
 
             log(f"[TRY] selector: {sel}")
 
@@ -105,13 +193,15 @@ def main():
 
                 btn = page.locator(sel).first
 
-                btn.wait_for(state="visible", timeout=8000)
+                btn.scroll_into_view_if_needed(timeout=5_000)
+
+                btn.wait_for(state="visible", timeout=5_000)
 
                 btn.click()
 
                 time.sleep(2)
 
-                shot(page, f"step2_click_{sel.replace('/', '_')}")
+                shot(page, f"step2_clicked_{idx}")
 
                 modal_opened = True
 
@@ -143,13 +233,11 @@ def main():
 
 
 
-        # ===== モーダル内スクロール =====
+        # 3) モーダル内をスクロールしてレビュー読み込み
 
-        log("[3] scroll reviews")
+        log("[3] scroll reviews inside modal")
 
         dialog = page.locator("div[role='dialog']").first
-
-
 
         for i in range(25):
 
@@ -163,19 +251,23 @@ def main():
 
             time.sleep(0.8)
 
-            shot(page, f"step3_scroll_{i}")
+            if i in (0, 10, 20):
+
+                shot(page, f"step3_scroll_{i}")
 
 
 
-        # ===== 「すべて表示」をできるだけ全部クリック =====
+        # 4) 「すべて表示」をできるだけクリック
 
         log("[4] expand all 'すべて表示'")
 
-        for i in range(5):
+        for _ in range(5):
 
             btns = page.get_by_text("すべて表示", exact=False)
 
-            for j in range(btns.count()):
+            count = btns.count()
+
+            for j in range(count):
 
                 try:
 
@@ -187,11 +279,9 @@ def main():
 
                     pass
 
-            shot(page, f"step4_expand_{i}")
 
 
-
-        # ===== レビュー抽出（シンプル版） =====
+        # 5) レビュー抽出
 
         log("[5] extract reviews")
 
@@ -225,11 +315,15 @@ def main():
 
                 continue
 
+
+
             lines = [l.strip() for l in txt.splitlines() if l.strip()]
 
             if not lines:
 
                 continue
+
+
 
             name = lines[0]
 
@@ -241,7 +335,7 @@ def main():
 
 
 
-        # ===== CSV 保存 =====
+        # CSV 保存
 
         csv_path = OUTPUT_DIR / "reviews.csv"
 
@@ -259,6 +353,20 @@ def main():
 
 
 
+        # MD 保存
+
+        md_path = OUTPUT_DIR / "reviews.md"
+
+        with md_path.open("w", encoding="utf-8") as f:
+
+            for r in reviews:
+
+                f.write(f"## {r['name']} ({r['date']})\n\n{r['text']}\n\n---\n\n")
+
+        log(f"[DONE] MD  -> {md_path}")
+
+
+
         log("[6] closing browser (finalize video)")
 
         context.close()
@@ -266,10 +374,4 @@ def main():
         browser.close()
 
         log("[DONE] finished with video")
-
-
-
-if __name__ == "__main__":
-
-    main()
 
