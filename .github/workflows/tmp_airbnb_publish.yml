@@ -1,0 +1,129 @@
+name: Temp Airbnb Photo ZIP Publisher
+on:
+  push:
+    branches:
+      - tmp-airbnb-photos-1591644672258346257
+    paths:
+      - .github/workflows/tmp_airbnb_publish.yml
+
+permissions:
+  contents: write
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install packages
+        run: pip install requests pillow pillow-avif-plugin
+      - name: Download, verify, and ZIP listing photos
+        shell: bash
+        run: |
+          cat > /tmp/make_zip.py <<'PY'
+          import html, io, os, re, shutil, zipfile
+          from pathlib import Path
+          import requests
+          from PIL import Image
+          import pillow_avif  # noqa
+
+          listing_id = '1591644672258346257'
+          listing_url = f'https://www.airbnb.jp/rooms/{listing_id}'
+          out = Path('tmp_airbnb_photos')
+          verify = Path('tmp_airbnb_verify')
+          zip_path = Path(f'airbnb_photos_{listing_id}.zip')
+          out.mkdir(exist_ok=True)
+
+          fallback_ids = [
+            '0ccd6041-9d59-414a-a021-1a862de709e2.jpeg',
+            '517ccd09-1d7b-444e-98b3-593ab4df5a43.jpeg',
+            '3a0a92ca-9ce2-4cb9-8ab7-f5ddfc07b6ce.jpeg',
+            '7da2426a-132f-4c43-a695-74c69f155d9f.jpeg',
+            '323b2d7d-83df-4b91-96ee-d7e98a9391a2.jpeg',
+            '27a09288-4940-42cd-946f-7b927495f097.jpeg',
+            '8ee8e204-09e0-43b8-aaee-244485d296c5.jpeg',
+            '7107f2d9-bc0f-4672-ba83-33b59f567aa4.jpeg',
+          ]
+          headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+            'Accept-Language': 'ja-JP,ja;q=0.9,en;q=0.8',
+          }
+          s = requests.Session(); s.headers.update(headers)
+
+          ids = []
+          try:
+            r = s.get(listing_url, timeout=45)
+            r.raise_for_status()
+            text = html.unescape(r.text)
+            for _ in range(3):
+              text = text.replace('\\u002F','/').replace('\\u002f','/').replace('\\/','/')
+            pat = rf'Hosting-{listing_id}/original/([0-9a-fA-F-]{{36}}\.(?:jpeg|jpg|png|webp))'
+            for x in re.findall(pat, text):
+              if x not in ids: ids.append(x)
+          except Exception as e:
+            print('listing HTML extraction warning:', repr(e))
+
+          # Put the publicly observed display-order photos first, then any additional gallery photos.
+          ordered = []
+          for x in fallback_ids + ids:
+            if x not in ordered: ordered.append(x)
+          print('candidate photos:', len(ordered))
+
+          saved = []
+          for x in ordered:
+            base = f'https://a0.muscache.com/im/pictures/hosting/Hosting-{listing_id}/original/{x}'
+            target = out / f'写真_{len(saved)+1:03d}.jpg'
+            err = None
+            for u in (base+'?im_w=1440&im_format=jpeg', base+'?im_w=1440', base):
+              try:
+                rr = s.get(u, headers={**headers,'Referer':listing_url,'Accept':'image/avif,image/webp,image/jpeg,image/*,*/*;q=0.8'}, timeout=45)
+                rr.raise_for_status()
+                with Image.open(io.BytesIO(rr.content)) as im:
+                  im.load()
+                  if im.mode != 'RGB': im = im.convert('RGB')
+                  im.save(target, 'JPEG', quality=95, subsampling=0, optimize=True)
+                with Image.open(target) as check: check.verify()
+                if target.stat().st_size < 5000: raise ValueError('image too small')
+                saved.append(target)
+                print('saved', target.name, target.stat().st_size)
+                break
+              except Exception as e:
+                err = e
+                if target.exists(): target.unlink()
+            else:
+              print('failed', x, repr(err))
+
+          if len(saved) < 8:
+            raise RuntimeError(f'Only {len(saved)} valid images downloaded')
+
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+            for p in saved: z.write(p, arcname=p.name)
+
+          source_names = [p.name for p in saved]
+          with zipfile.ZipFile(zip_path) as z:
+            infos = z.infolist()
+            if [i.filename for i in infos] != source_names: raise RuntimeError('ZIP filename mismatch')
+            for i in infos:
+              if not (i.flag_bits & 0x800): raise RuntimeError('UTF-8 flag missing: '+i.filename)
+            if verify.exists(): shutil.rmtree(verify)
+            z.extractall(verify)
+          extracted_names = sorted(p.name for p in verify.iterdir() if p.is_file())
+          if extracted_names != sorted(source_names): raise RuntimeError('extracted filenames mismatch')
+          for p in verify.iterdir():
+            with Image.open(p) as im: im.verify()
+
+          Path('tmp_photo_count.txt').write_text(str(len(saved)), encoding='utf-8')
+          print('FINAL_COUNT', len(saved))
+          print('ZIP_SIZE', zip_path.stat().st_size)
+          PY
+          python /tmp/make_zip.py
+      - name: Commit verified outputs to temporary branch
+        run: |
+          git config user.name 'chatgpt-temp-export'
+          git config user.email 'actions@users.noreply.github.com'
+          git add airbnb_photos_1591644672258346257.zip tmp_photo_count.txt
+          git commit -m 'temp: verified Airbnb photo ZIP'
+          git push
