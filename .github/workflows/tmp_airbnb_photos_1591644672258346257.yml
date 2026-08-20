@@ -1,0 +1,272 @@
+name: Temp Airbnb Photo Export
+on:
+  push:
+    branches:
+      - tmp-airbnb-photos-1591644672258346257
+
+permissions:
+  contents: read
+
+env:
+  LISTING_ID: "1591644672258346257"
+  LISTING_URL: "https://www.airbnb.jp/rooms/1591644672258346257"
+
+jobs:
+  export-photos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright requests pillow pillow-avif-plugin
+          python -m playwright install --with-deps chromium
+
+      - name: Extract and package photos
+        shell: bash
+        run: |
+          cat > /tmp/export_photos.py <<'PY'
+          import html
+          import io
+          import json
+          import os
+          import re
+          import shutil
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urlsplit, urlunsplit
+
+          import requests
+          from PIL import Image
+          import pillow_avif  # noqa: F401
+          from playwright.sync_api import sync_playwright
+
+          listing_id = os.environ["LISTING_ID"]
+          listing_url = os.environ["LISTING_URL"]
+          prefix = f"Hosting-{listing_id}/original/"
+          out_dir = Path("airbnb_photos")
+          verify_dir = Path("verify_extract")
+          zip_path = Path(f"Airbnb_写真_{listing_id}.zip")
+          out_dir.mkdir(exist_ok=True)
+
+          # Fallback URLs already observed on the public listing page, in display order.
+          fallback = [
+              "https://a0.muscache.com/im/pictures/hosting/Hosting-1591644672258346257/original/0ccd6041-9d59-414a-a021-1a862de709e2.jpeg",
+              "https://a0.muscache.com/im/pictures/hosting/Hosting-1591644672258346257/original/517ccd09-1d7b-444e-98b3-593ab4df5a43.jpeg",
+              "https://a0.muscache.com/im/pictures/hosting/Hosting-1591644672258346257/original/3a0a92ca-9ce2-4cb9-8ab7-f5ddfc07b6ce.jpeg",
+              "https://a0.muscache.com/im/pictures/hosting/Hosting-1591644672258346257/original/7da2426a-132f-4c43-a695-74c69f155d9f.jpeg",
+              "https://a0.muscache.com/im/pictures/hosting/Hosting-1591644672258346257/original/323b2d7d-83df-4b91-96ee-d7e98a9391a2.jpeg",
+              "https://a0.muscache.com/im/pictures/hosting/Hosting-1591644672258346257/original/27a09288-4940-42cd-946f-7b927495f097.jpeg",
+              "https://a0.muscache.com/im/pictures/hosting/Hosting-1591644672258346257/original/8ee8e204-09e0-43b8-aaee-244485d296c5.jpeg",
+              "https://a0.muscache.com/im/pictures/hosting/Hosting-1591644672258346257/original/7107f2d9-bc0f-4672-ba83-33b59f567aa4.jpeg",
+          ]
+
+          def normalize(u: str):
+              if not u:
+                  return None
+              u = html.unescape(u).replace("\\u002F", "/").replace("\\/", "/")
+              if "muscache.com" not in u or prefix not in u:
+                  return None
+              u = u.split(" ")[0].strip('"\'')
+              p = urlsplit(u)
+              return urlunsplit((p.scheme or "https", p.netloc, p.path, "", ""))
+
+          found = []
+          seen = set()
+          def add(u):
+              u = normalize(u)
+              if u and u not in seen:
+                  seen.add(u)
+                  found.append(u)
+
+          # Collect URLs from the rendered listing and the full-photo gallery.
+          try:
+              with sync_playwright() as p:
+                  browser = p.chromium.launch(headless=True)
+                  context = browser.new_context(
+                      viewport={"width": 1440, "height": 1000},
+                      locale="ja-JP",
+                      user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                  )
+                  page = context.new_page()
+                  page.on("request", lambda req: add(req.url))
+                  page.goto(listing_url, wait_until="domcontentloaded", timeout=120000)
+                  page.wait_for_timeout(8000)
+
+                  # DOM and embedded JSON/HTML often already contain gallery image URLs.
+                  content = page.content()
+                  for m in re.findall(r'https?:[^"\'<>\\s]+', content):
+                      add(m)
+                  for m in re.findall(r'https:\\/\\/[^"\'<>\\s]+', content):
+                      add(m)
+
+                  # Capture currently rendered images in DOM order.
+                  attrs = page.locator("img").evaluate_all("els => els.flatMap(e => [e.src, e.currentSrc, e.srcset])")
+                  for a in attrs:
+                      if not a:
+                          continue
+                      for part in str(a).split(','):
+                          add(part.strip().split(' ')[0])
+
+                  # Open the full gallery if present.
+                  clicked = False
+                  candidates = [
+                      "button:has-text('すべての写真を表示')",
+                      "button:has-text('Show all photos')",
+                      "text=すべての写真を表示",
+                      "text=Show all photos",
+                  ]
+                  for sel in candidates:
+                      try:
+                          loc = page.locator(sel).first
+                          if loc.count() and loc.is_visible():
+                              loc.click(timeout=5000)
+                              clicked = True
+                              break
+                      except Exception:
+                          pass
+                  if clicked:
+                      page.wait_for_timeout(5000)
+
+                  # Scroll repeatedly to force lazy-loaded gallery images to appear.
+                  stagnant = 0
+                  last_count = len(found)
+                  for _ in range(60):
+                      page.mouse.wheel(0, 1200)
+                      page.wait_for_timeout(350)
+                      attrs = page.locator("img").evaluate_all("els => els.flatMap(e => [e.src, e.currentSrc, e.srcset])")
+                      for a in attrs:
+                          if not a:
+                              continue
+                          for part in str(a).split(','):
+                              add(part.strip().split(' ')[0])
+                      if len(found) == last_count:
+                          stagnant += 1
+                      else:
+                          stagnant = 0
+                          last_count = len(found)
+                      if stagnant >= 12:
+                          break
+                  # One final HTML pass after scrolling.
+                  content = page.content()
+                  for m in re.findall(r'https?:[^"\'<>\\s]+', content):
+                      add(m)
+                  context.close()
+                  browser.close()
+          except Exception as e:
+              print("Browser extraction warning:", repr(e))
+
+          # Ensure the publicly observed listing images are present even if Airbnb blocks automation.
+          for u in fallback:
+              add(u)
+
+          print(f"Unique listing photo URLs: {len(found)}")
+          print(json.dumps(found, ensure_ascii=False, indent=2))
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+              "Accept": "image/jpeg,image/png,image/avif,image/webp,image/*;q=0.8,*/*;q=0.5",
+              "Referer": listing_url,
+          })
+
+          saved = []
+          for i, base in enumerate(found, 1):
+              filename = f"写真_{i:03d}.jpg"
+              path = out_dir / filename
+              attempts = [base + "?im_w=1440&im_format=jpeg", base + "?im_w=1440", base]
+              last_err = None
+              for url in attempts:
+                  try:
+                      r = session.get(url, timeout=45)
+                      r.raise_for_status()
+                      if not r.content:
+                          raise ValueError("empty response")
+                      with Image.open(io.BytesIO(r.content)) as im:
+                          im.load()
+                          if im.mode not in ("RGB", "L"):
+                              if "A" in im.mode:
+                                  bg = Image.new("RGB", im.size, "white")
+                                  bg.paste(im, mask=im.getchannel("A"))
+                                  im = bg
+                              else:
+                                  im = im.convert("RGB")
+                          elif im.mode == "L":
+                              im = im.convert("RGB")
+                          im.save(path, "JPEG", quality=95, subsampling=0, optimize=True)
+                      # Verify saved JPEG and reject tiny placeholders.
+                      with Image.open(path) as check:
+                          check.verify()
+                      if path.stat().st_size < 5000:
+                          raise ValueError("image unexpectedly small")
+                      saved.append(path)
+                      print(f"saved {filename}: {path.stat().st_size} bytes")
+                      break
+                  except Exception as e:
+                      last_err = e
+                      if path.exists():
+                          path.unlink()
+              else:
+                  print(f"FAILED {base}: {last_err}")
+
+          if len(saved) < 8:
+              raise RuntimeError(f"Only {len(saved)} images downloaded; expected at least 8")
+
+          # Re-number in case any discovered URL failed so names remain contiguous.
+          for idx, old in enumerate(saved, 1):
+              new = out_dir / f"写真_{idx:03d}.jpg"
+              if old != new:
+                  old.replace(new)
+          saved = sorted(out_dir.glob("写真_*.jpg"))
+
+          # Final image integrity check before ZIP.
+          for pth in saved:
+              with Image.open(pth) as im:
+                  im.verify()
+
+          with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              for pth in saved:
+                  zf.write(pth, arcname=pth.name)
+
+          # ZIP Unicode flag and extraction verification.
+          with zipfile.ZipFile(zip_path, "r") as zf:
+              infos = zf.infolist()
+              zip_names = [x.filename for x in infos]
+              source_names = [p.name for p in saved]
+              if zip_names != source_names:
+                  raise RuntimeError(f"ZIP names mismatch: {zip_names} != {source_names}")
+              for info in infos:
+                  if not (info.flag_bits & 0x800):
+                      raise RuntimeError(f"UTF-8 filename flag missing: {info.filename}")
+              if verify_dir.exists():
+                  shutil.rmtree(verify_dir)
+              zf.extractall(verify_dir)
+
+          extracted_names = sorted(p.name for p in verify_dir.iterdir() if p.is_file())
+          source_names_sorted = sorted(p.name for p in saved)
+          if extracted_names != source_names_sorted:
+              raise RuntimeError(f"Extracted filenames mismatch: {extracted_names} != {source_names_sorted}")
+          for pth in sorted(verify_dir.glob("写真_*.jpg")):
+              with Image.open(pth) as im:
+                  im.verify()
+
+          print(f"FINAL_PHOTO_COUNT={len(saved)}")
+          print(f"FINAL_ZIP={zip_path}")
+          print(f"FINAL_ZIP_SIZE={zip_path.stat().st_size}")
+          PY
+          python /tmp/export_photos.py
+
+      - name: Upload verified ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: airbnb-photos-1591644672258346257
+          path: Airbnb_写真_1591644672258346257.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
